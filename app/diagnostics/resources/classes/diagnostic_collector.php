@@ -321,7 +321,6 @@
 			$sql = "select
 					start_stamp,
 					direction,
-					call_direction,
 					caller_id_name,
 					caller_id_number,
 					destination_number,
@@ -329,6 +328,7 @@
 					duration,
 					sip_hangup_disposition,
 					hangup_cause,
+					domain_uuid,
 					xml_cdr_uuid,
 					record_name,
 					record_path
@@ -402,13 +402,14 @@
 					}
 					$records[] = [
 						'start_time' => (string) ($row['start_stamp'] ?? ''),
-						'direction' => (string) ($row['direction'] ?? ($row['call_direction'] ?? '')),
+						'direction' => (string) ($row['direction'] ?? ''),
 						'caller_id_name' => (string) ($row['caller_id_name'] ?? ''),
 						'caller_id_number' => (string) ($row['caller_id_number'] ?? ''),
 						'destination' => (string) ($row['destination_number'] ?? ''),
 						'duration' => (string) $duration,
 						'status' => (string) ($row['sip_hangup_disposition'] ?? ''),
 						'hangup_cause' => (string) ($row['hangup_cause'] ?? ''),
+					'domain_uuid' => (string) ($row['domain_uuid'] ?? ''),
 						'call_uuid' => (string) ($row['xml_cdr_uuid'] ?? ''),
 						'recording_present' => (!empty($row['record_name']) || !empty($row['record_path'])),
 					];

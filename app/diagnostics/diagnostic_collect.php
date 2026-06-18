@@ -549,6 +549,8 @@
 		echo "			</table>\n";
 
 		if (!empty($cdr_preview_records) && is_array($cdr_preview_records)) {
+			$can_view_record = permission_exists('xml_cdr_details');
+			$all_domains_scope = (($cdr_filters['scope'] ?? 'current_domain') === 'all_domains');
 			echo "			<table class='list'>\n";
 			echo "			<tr class='list-header'>\n";
 			echo "				<th>Start Time</th>\n";
@@ -560,9 +562,32 @@
 			echo "				<th>Status</th>\n";
 			echo "				<th>Hangup Cause</th>\n";
 			echo "				<th>Call UUID</th>\n";
+			echo "				<th>View Record</th>\n";
 			echo "				<th>Recording Present</th>\n";
 			echo "			</tr>\n";
 			foreach ($cdr_preview_records as $cdr_row) {
+				$call_uuid = trim((string) ($cdr_row['call_uuid'] ?? ''));
+				$valid_call_uuid = false;
+				if ($call_uuid !== '') {
+					if (function_exists('is_uuid')) {
+						$valid_call_uuid = is_uuid($call_uuid);
+					}
+					else {
+						$valid_call_uuid = (bool) preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i', $call_uuid);
+					}
+				}
+				$view_record_link = '';
+				if ($can_view_record && $valid_call_uuid) {
+					$view_record_link = PROJECT_PATH.'/app/xml_cdr/xml_cdr_details.php?id='.urlencode($call_uuid);
+					if ($all_domains_scope) {
+						$view_record_link .= '&show=all';
+						$row_domain_uuid = trim((string) ($cdr_row['domain_uuid'] ?? ''));
+						$session_domain_uuid = trim((string) ($_SESSION['domain_uuid'] ?? ''));
+						if (permission_exists('domain_select') && $row_domain_uuid !== '' && $row_domain_uuid !== $session_domain_uuid) {
+							$view_record_link .= '&domain_uuid='.urlencode($row_domain_uuid).'&domain_change=true';
+						}
+					}
+				}
 				echo "			<tr class='list-row'>\n";
 				echo "				<td>".escape((string) ($cdr_row['start_time'] ?? ''))."</td>\n";
 				echo "				<td>".escape((string) ($cdr_row['direction'] ?? ''))."</td>\n";
@@ -572,7 +597,13 @@
 				echo "				<td>".escape((string) ($cdr_row['duration'] ?? ''))."</td>\n";
 				echo "				<td>".escape((string) ($cdr_row['status'] ?? ''))."</td>\n";
 				echo "				<td>".escape((string) ($cdr_row['hangup_cause'] ?? ''))."</td>\n";
-				echo "				<td class='diagnostics-hash'>".escape((string) ($cdr_row['call_uuid'] ?? ''))."</td>\n";
+				echo "				<td class='diagnostics-hash'>".escape($call_uuid)."</td>\n";
+				if ($view_record_link !== '') {
+					echo "				<td><a href='".escape($view_record_link)."'>View Record</a></td>\n";
+				}
+				else {
+					echo "				<td>-</td>\n";
+				}
 				echo "				<td>".(!empty($cdr_row['recording_present']) ? 'Yes' : 'No')."</td>\n";
 				echo "			</tr>\n";
 			}
