@@ -114,6 +114,74 @@
 		}
 	}
 
+
+//download bounded selected-call CDR evidence bundle
+	if (isset($_POST['action']) && $_POST['action'] === 'download_cdr_evidence_bundle') {
+		if (!permission_exists('diagnostics_collect') || !permission_exists('diagnostics_download') || !permission_exists('xml_cdr_view')) {
+			echo "access denied";
+			exit;
+		}
+
+		$token = new token;
+		if (!$token->validate($_SERVER['PHP_SELF'])) {
+			message::add($text['message-invalid_token'], 'negative');
+			header('Location: diagnostic_collect.php');
+			exit;
+		}
+
+		$cdr_filters = [
+			'start_datetime' => trim((string) ($_POST['cdr_start_datetime'] ?? '')),
+			'end_datetime' => trim((string) ($_POST['cdr_end_datetime'] ?? '')),
+			'destination_number' => trim((string) ($_POST['cdr_destination_number'] ?? '')),
+			'caller_id' => trim((string) ($_POST['cdr_caller_id'] ?? '')),
+			'extension' => trim((string) ($_POST['cdr_extension'] ?? '')),
+			'call_uuid' => trim((string) ($_POST['cdr_call_uuid'] ?? '')),
+			'max_records' => $_POST['cdr_max_records'] ?? 25,
+			'include_logs' => !empty($_POST['cdr_include_logs']),
+			'scope' => trim((string) ($_POST['cdr_scope'] ?? 'current_domain')),
+		];
+
+		try {
+			$cdr_evidence_sections = $collector->collect_cdr_selected_evidence_sections($cdr_filters, [
+				'prior_preview_matched_count' => $_POST['cdr_preview_matched_count'] ?? null,
+				'prior_preview_selected_count' => $_POST['cdr_preview_selected_count'] ?? null,
+			]);
+
+			if (!empty($cdr_evidence_sections['errors'])) {
+				foreach ((array) $cdr_evidence_sections['errors'] as $error_message) {
+					$error_message = trim((string) $error_message);
+					if ($error_message !== '') {
+						message::add($error_message, 'negative');
+					}
+				}
+				header('Location: diagnostic_collect.php');
+				exit;
+			}
+
+			$sections = $collector->collect_sections();
+			$sections['cdr_collection_policy'] = $cdr_evidence_sections['collection_policy'] ?? [];
+			$sections['cdr_selected_call_index'] = $cdr_evidence_sections['call_index'] ?? [];
+			$sections['cdr_selected_calls'] = $cdr_evidence_sections['selected_calls'] ?? [];
+
+			$metadata = [
+				'schema_version' => diagnostic_collector::SCHEMA_VERSION,
+				'collector_version' => diagnostic_collector::COLLECTOR_VERSION,
+				'generated_at' => gmdate('c'),
+				'options' => [
+					'bundle_type' => 'cdr_evidence_phase_1a',
+				],
+				'warnings' => $cdr_evidence_sections['warnings'] ?? [],
+			];
+			$bundle = new diagnostic_bundle;
+			$bundle->stream($metadata, $sections);
+		}
+		catch (Throwable $e) {
+			message::add($e->getMessage(), 'negative');
+			header('Location: diagnostic_collect.php');
+			exit;
+		}
+	}
+
 	$show_cdr_details = is_array($cdr_match_preview);
 	$cdr_match_count_errors = [];
 	if (is_array($cdr_match_preview) && is_array($cdr_match_preview['errors'] ?? null)) {
@@ -402,7 +470,7 @@
 	echo "<tr class='list-row diagnostics-details' id='diagnostics_cdr_details'".($show_cdr_details ? " style='display: table-row;'" : '').">\n";
 	echo "	<td colspan='2'>\n";
 	echo "		<div class='diagnostics-child'>\n";
-	echo "			Detailed CDR collection is optional and request-driven because raw call evidence can be database intensive. Required: either Call UUID, or Start Datetime plus End Datetime. Other filters are optional. This Phase 1 panel performs a bounded match count preview only; it does not collect raw CDR rows, include CDRs in ZIP bundles, or run analysis.\n";
+	echo "			Detailed CDR collection is optional and request-driven because raw call evidence can be database intensive. Required: either Call UUID, or Start Datetime plus End Datetime. Other filters are optional. This Phase 1A panel supports bounded selected-call evidence metadata export. It does not include raw CDR bodies, transcript bodies, recording audio, or analysis findings.\n";
 	echo "			<br /><br />\n";
 	echo "			<form id='diagnostics_cdr_preview_form' method='post'>\n";
 	echo "			<table class='list diagnostics-detail-table'>\n";
@@ -454,7 +522,7 @@
 	echo "			<tr class='list-row'>\n";
 	echo "				<td>&nbsp;</td>\n";
 	echo "				<td>\n";
-	echo "					<input type='hidden' name='action' value='preview_cdr_match_count'>\n";
+	echo "					<input type='hidden' id='cdr_form_action' name='action' value='preview_cdr_match_count'>\n";
 	echo "					<input type='hidden' name='".$token['name']."' value='".$token['hash']."'>\n";
 	echo 	button::create(['type'=>'submit','label'=>'Submit','icon'=>'search']);
 	echo button::create([
@@ -547,6 +615,19 @@
 			}
 		}
 		echo "			</table>\n";
+		echo "			<input type='hidden' name='cdr_preview_matched_count' value=\"".escape((string) $matched_count)."\">\n";
+		echo "			<input type='hidden' name='cdr_preview_selected_count' value=\"".escape((string) count($cdr_preview_records))."\">\n";
+
+		if (permission_exists('diagnostics_download') && $preview_errors === '') {
+			echo "			<div style='margin: 10px 0 12px 0;'>\n";
+			echo button::create([
+				'type' => 'submit',
+				'label' => 'Download CDR Evidence Bundle',
+				'icon' => $settings->get('theme', 'button_icon_download'),
+				'onclick' => "var actionField = document.getElementById('cdr_form_action'); if (actionField) { actionField.value='download_cdr_evidence_bundle'; }",
+			]);
+			echo "			</div>\n";
+		}
 
 		if (!empty($cdr_preview_records) && is_array($cdr_preview_records)) {
 			$can_view_record = permission_exists('xml_cdr_details');

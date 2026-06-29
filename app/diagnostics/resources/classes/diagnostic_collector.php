@@ -425,6 +425,276 @@
 			];
 		}
 
+
+		/**
+		 * Collect bounded selected-call CDR evidence sections for bundle export.
+		 *
+		 * @param array $filters
+		 * @param array $options
+		 * @return array
+		 */
+		public function collect_cdr_selected_evidence_sections($filters = [], $options = []) {
+			global $database;
+
+			$warnings = [];
+			$errors = [];
+			$filters = is_array($filters) ? $filters : [];
+
+			if (!permission_exists('diagnostics_collect')) {
+				$errors[] = 'diagnostics_collect permission required.';
+			}
+			if (!permission_exists('diagnostics_download')) {
+				$errors[] = 'diagnostics_download permission required.';
+			}
+			if (!permission_exists('xml_cdr_view')) {
+				$errors[] = 'xml_cdr_view permission required.';
+			}
+			if (!is_object($database)) {
+				$errors[] = 'database connection unavailable.';
+			}
+
+			$include_logs_requested = !empty($filters['include_logs']);
+			$filters['include_logs'] = false;
+			if ($include_logs_requested) {
+				$warnings[] = 'Include Logs is inactive in Phase 1A and was ignored.';
+			}
+
+			$match = $this->collect_cdr_detailed_match_count($filters);
+			$preview = $this->collect_cdr_preview_records($filters);
+			$warnings = array_values(array_unique(array_merge(
+				$warnings,
+				is_array($match['warnings'] ?? null) ? $match['warnings'] : [],
+				is_array($preview['warnings'] ?? null) ? $preview['warnings'] : []
+			)));
+			$errors = array_values(array_unique(array_merge(
+				$errors,
+				is_array($match['errors'] ?? null) ? $match['errors'] : [],
+				is_array($preview['errors'] ?? null) ? $preview['errors'] : []
+			)));
+
+			$matched_count = (int) ($match['matched_count'] ?? 0);
+			$max_records = (int) ($match['max_records'] ?? 25);
+			$effective_filters = is_array($match['effective_filters'] ?? null) ? $match['effective_filters'] : [];
+			$selected_preview_rows = is_array($preview['records'] ?? null) ? $preview['records'] : [];
+
+			$prior_preview_matched_count = null;
+			if (isset($options['prior_preview_matched_count']) && $options['prior_preview_matched_count'] !== '') {
+				$prior_preview_matched_count = (int) $options['prior_preview_matched_count'];
+				if ($prior_preview_matched_count !== $matched_count) {
+					$warnings[] = 'Current matched count differs from the prior preview count.';
+				}
+			}
+
+			$prior_preview_selected_count = null;
+			if (isset($options['prior_preview_selected_count']) && $options['prior_preview_selected_count'] !== '') {
+				$prior_preview_selected_count = (int) $options['prior_preview_selected_count'];
+				if ($prior_preview_selected_count !== count($selected_preview_rows)) {
+					$warnings[] = 'Current selected call count differs from the prior preview count.';
+				}
+			}
+
+			$selected_call_uuids = [];
+			foreach ($selected_preview_rows as $selected_preview_row) {
+				$call_uuid = trim((string) ($selected_preview_row['call_uuid'] ?? ''));
+				if ($this->is_valid_uuid($call_uuid) && !in_array($call_uuid, $selected_call_uuids, true)) {
+					$selected_call_uuids[] = $call_uuid;
+				}
+			}
+
+			$selected_rows_by_uuid = [];
+			$flow_rows_by_uuid = [];
+			$queue_rows_by_uuid = [];
+			$transcript_rows_by_uuid = [];
+			if (empty($errors) && !empty($selected_call_uuids)) {
+				$parameters = [];
+				$in_clause = $this->build_in_clause($selected_call_uuids, 'cdr_uuid', $parameters);
+				try {
+					$sql = "select * from v_xml_cdr where xml_cdr_uuid in (".$in_clause.")";
+					$selected_rows = $database->select($sql, $parameters, 'all');
+					if (is_array($selected_rows)) {
+						foreach ($selected_rows as $selected_row) {
+							$row_uuid = trim((string) ($selected_row['xml_cdr_uuid'] ?? ''));
+							if ($row_uuid !== '') {
+								$selected_rows_by_uuid[$row_uuid] = $selected_row;
+							}
+						}
+					}
+				}
+				catch (Throwable $e) {
+					$errors[] = 'Selected call lookup query failed.';
+				}
+
+				$parameters = [];
+				$in_clause = $this->build_in_clause($selected_call_uuids, 'flow_uuid', $parameters);
+				try {
+					$sql = "select xml_cdr_uuid, call_flow from v_xml_cdr_flow where xml_cdr_uuid in (".$in_clause.")";
+					$flow_rows = $database->select($sql, $parameters, 'all');
+					if (is_array($flow_rows)) {
+						foreach ($flow_rows as $flow_row) {
+							$row_uuid = trim((string) ($flow_row['xml_cdr_uuid'] ?? ''));
+							if ($row_uuid !== '' && !array_key_exists($row_uuid, $flow_rows_by_uuid)) {
+								$flow_rows_by_uuid[$row_uuid] = $flow_row['call_flow'] ?? null;
+							}
+						}
+					}
+				}
+				catch (Throwable $e) {
+					$warnings[] = 'v_xml_cdr_flow query unavailable; flow metadata was skipped.';
+				}
+
+				$parameters = [];
+				$in_clause = $this->build_in_clause($selected_call_uuids, 'queue_uuid', $parameters);
+				try {
+					$sql = "select transcribe_queue_uuid, transcribe_status, transcribe_duration, hostname, transcribe_audio_path, transcribe_audio_name ";
+					$sql .= "from v_transcribe_queue where transcribe_queue_uuid in (".$in_clause.")";
+					$queue_rows = $database->select($sql, $parameters, 'all');
+					if (is_array($queue_rows)) {
+						foreach ($queue_rows as $queue_row) {
+							$row_uuid = trim((string) ($queue_row['transcribe_queue_uuid'] ?? ''));
+							if ($row_uuid !== '' && !array_key_exists($row_uuid, $queue_rows_by_uuid)) {
+								$queue_rows_by_uuid[$row_uuid] = $queue_row;
+							}
+						}
+					}
+				}
+				catch (Throwable $e) {
+					$warnings[] = 'v_transcribe_queue query unavailable; transcript queue metadata was skipped.';
+				}
+
+				$parameters = [];
+				$in_clause = $this->build_in_clause($selected_call_uuids, 'transcript_uuid', $parameters);
+				try {
+					$sql = "select xml_cdr_uuid, transcript_json, transcript_summary from v_xml_cdr_transcripts ";
+					$sql .= "where xml_cdr_uuid in (".$in_clause.")";
+					$transcript_rows = $database->select($sql, $parameters, 'all');
+					if (is_array($transcript_rows)) {
+						foreach ($transcript_rows as $transcript_row) {
+							$row_uuid = trim((string) ($transcript_row['xml_cdr_uuid'] ?? ''));
+							if ($row_uuid !== '' && !array_key_exists($row_uuid, $transcript_rows_by_uuid)) {
+								$transcript_rows_by_uuid[$row_uuid] = $transcript_row;
+							}
+						}
+					}
+				}
+				catch (Throwable $e) {
+					$warnings[] = 'v_xml_cdr_transcripts query unavailable; transcript metadata was skipped.';
+				}
+			}
+
+			$selected_calls = [];
+			$calls_warnings = [];
+			foreach ($selected_call_uuids as $selected_call_uuid) {
+				$selected_row = $selected_rows_by_uuid[$selected_call_uuid] ?? [];
+				if (empty($selected_row)) {
+					$calls_warnings[] = 'No v_xml_cdr row was found for one or more selected UUIDs.';
+				}
+
+				$flow_value = $flow_rows_by_uuid[$selected_call_uuid] ?? null;
+				$flow_metadata = $this->flow_metadata($flow_value);
+				$recording_metadata = $this->recording_metadata($selected_row);
+				if (!empty($recording_metadata['warnings'])) {
+					$calls_warnings = array_merge($calls_warnings, $recording_metadata['warnings']);
+				}
+				$transcript_metadata = $this->transcript_metadata(
+					$selected_call_uuid,
+					$queue_rows_by_uuid[$selected_call_uuid] ?? null,
+					$transcript_rows_by_uuid[$selected_call_uuid] ?? null
+				);
+				$provenance_metadata = $this->cdr_provenance_metadata($selected_call_uuid, $selected_row);
+				if (!empty($provenance_metadata['warnings'])) {
+					$calls_warnings = array_merge($calls_warnings, $provenance_metadata['warnings']);
+				}
+				$failed_import_metadata = $this->failed_import_artifact_metadata($selected_call_uuid);
+
+				$selected_calls[] = [
+					'xml_cdr_uuid' => $selected_call_uuid,
+					'v_xml_cdr' => $this->sanitize_cdr_row($selected_row),
+					'v_xml_cdr_flow' => $flow_metadata,
+					'recording_metadata' => $recording_metadata['metadata'],
+					'transcript_metadata' => $transcript_metadata,
+					'raw_cdr_provenance' => $provenance_metadata['metadata'],
+					'failed_import_artifacts' => $failed_import_metadata,
+				];
+			}
+			$calls_warnings = array_values(array_unique($calls_warnings));
+			$warnings = array_values(array_unique($warnings));
+
+			$collection_policy = [
+				'status' => empty($errors) ? 'collected' : 'error',
+				'scope' => 'bounded selected calls',
+				'record_count' => count($selected_call_uuids),
+				'warnings' => $warnings,
+				'errors' => $errors,
+				'phase' => '1A',
+				'included' => [
+					'v_xml_cdr operational row (non-secret fields only)',
+					'v_xml_cdr_flow call_flow metadata when present',
+					'recording metadata only',
+					'transcript metadata only',
+					'raw CDR provenance metadata only',
+					'failed-import artifact metadata when safely associated',
+				],
+				'excluded' => [
+					'recording audio',
+					'waveform output',
+					'call_recording_base64',
+					'transcript_json body',
+					'transcript_summary text',
+					'raw xml/json CDR body',
+					'cdr log content',
+					'passwords',
+					'sip credentials',
+					'tokens',
+					'api keys',
+					'unrelated freeswitch logs',
+				],
+				'enforcement' => [
+					'search_revalidated_server_side' => true,
+					'posted_preview_rows_trusted' => false,
+					'posted_uuid_lists_trusted' => false,
+					'posted_browser_counts_trusted' => false,
+					'include_logs_active' => false,
+				],
+			];
+
+			$call_index = [
+				'status' => empty($errors) ? 'collected' : 'error',
+				'scope' => 'bounded selected calls',
+				'record_count' => count($selected_call_uuids),
+				'warnings' => $warnings,
+				'errors' => $errors,
+				'matched_count' => $matched_count,
+				'selected_count' => count($selected_call_uuids),
+				'max_records' => $max_records,
+				'effective_filters' => $effective_filters,
+				'prior_preview' => [
+					'matched_count' => $prior_preview_matched_count,
+					'selected_count' => $prior_preview_selected_count,
+				],
+				'call_uuids' => $selected_call_uuids,
+			];
+
+			$calls_section = [
+				'status' => empty($errors) ? 'collected' : 'error',
+				'scope' => 'bounded selected calls',
+				'record_count' => count($selected_calls),
+				'warnings' => $calls_warnings,
+				'errors' => $errors,
+				'calls' => $selected_calls,
+			];
+
+			return [
+				'collection_policy' => $collection_policy,
+				'call_index' => $call_index,
+				'selected_calls' => $calls_section,
+				'matched_count' => $matched_count,
+				'selected_count' => count($selected_call_uuids),
+				'effective_filters' => $effective_filters,
+				'warnings' => $warnings,
+				'errors' => $errors,
+			];
+		}
+
 		/**
 		 * Collect a safe, read-only system information preview.
 		 *
@@ -1928,9 +2198,543 @@
 		 * @param mixed $value
 		 * @return void
 		 */
+
 		private function warn_if_empty(&$warnings, $field, $value) {
 			if ($value === null || $value === '') {
 				$warnings[] = $field.' unavailable';
+			}
+		}
+
+		/**
+		 * Build an IN-clause placeholder list and parameter map.
+		 *
+		 * @param array $values
+		 * @param string $prefix
+		 * @param array $parameters
+		 * @return string
+		 */
+		private function build_in_clause($values, $prefix, &$parameters) {
+			$values = is_array($values) ? array_values($values) : [];
+			$placeholders = [];
+			foreach ($values as $index => $value) {
+				$key = $prefix.'_'.$index;
+				$placeholders[] = ':'.$key;
+				$parameters[$key] = (string) $value;
+			}
+			return !empty($placeholders) ? implode(', ', $placeholders) : "''";
+		}
+
+		/**
+		 * Determine whether a value is a valid UUID.
+		 *
+		 * @param string $uuid
+		 * @return bool
+		 */
+		private function is_valid_uuid($uuid) {
+			$uuid = trim((string) $uuid);
+			if ($uuid === '') {
+				return false;
+			}
+			if (function_exists('is_uuid')) {
+				return is_uuid($uuid);
+			}
+			return (bool) preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i', $uuid);
+		}
+
+		/**
+		 * Return a redacted operational CDR row.
+		 *
+		 * @param array $row
+		 * @return array
+		 */
+		private function sanitize_cdr_row($row) {
+			if (!is_array($row)) {
+				return [];
+			}
+
+			$blocked_exact = [
+				'xml',
+				'json',
+				'call_recording_base64',
+				'transcript_json',
+				'transcript_summary',
+				'log_content',
+			];
+			$blocked_keywords = [
+				'password',
+				'secret',
+				'token',
+				'api_key',
+				'apikey',
+				'credential',
+				'auth',
+			];
+
+			$sanitized = [];
+			foreach ($row as $key => $value) {
+				$key_name = strtolower((string) $key);
+				if (in_array($key_name, $blocked_exact, true)) {
+					continue;
+				}
+				$skip = false;
+				foreach ($blocked_keywords as $blocked_keyword) {
+					if (strpos($key_name, $blocked_keyword) !== false) {
+						$skip = true;
+						break;
+					}
+				}
+				if ($skip) {
+					continue;
+				}
+				if (is_array($value) || is_object($value)) {
+					$encoded = json_encode($value, JSON_UNESCAPED_SLASHES);
+					$sanitized[$key] = $encoded === false ? null : $encoded;
+				}
+				else {
+					$sanitized[$key] = $value;
+				}
+			}
+			return $sanitized;
+		}
+
+		/**
+		 * Return call-flow metadata without exporting body content.
+		 *
+		 * @param mixed $flow_value
+		 * @return array
+		 */
+		private function flow_metadata($flow_value) {
+			$present = !($flow_value === null || $flow_value === '');
+			$size_bytes = null;
+			$sha256 = null;
+			$json_valid = null;
+			$call_flow = null;
+			if ($present) {
+				if (is_array($flow_value)) {
+					$call_flow = $flow_value;
+					$encoded = json_encode($flow_value, JSON_UNESCAPED_SLASHES);
+					if ($encoded !== false) {
+						$size_bytes = strlen($encoded);
+						$sha256 = hash('sha256', $encoded);
+						$json_valid = true;
+					}
+					else {
+						$json_valid = false;
+					}
+				}
+				elseif (is_object($flow_value)) {
+					$encoded = json_encode($flow_value, JSON_UNESCAPED_SLASHES);
+					if ($encoded !== false) {
+						$size_bytes = strlen($encoded);
+						$sha256 = hash('sha256', $encoded);
+						$decoded = json_decode($encoded, true);
+						$json_valid = json_last_error() === JSON_ERROR_NONE && is_array($decoded);
+						if ($json_valid) {
+							$call_flow = $decoded;
+						}
+					}
+					else {
+						$json_valid = false;
+					}
+				}
+				else {
+					$flow_string = (string) $flow_value;
+					$size_bytes = strlen($flow_string);
+					$sha256 = hash('sha256', $flow_string);
+					$decoded = json_decode($flow_string, true);
+					$json_valid = json_last_error() === JSON_ERROR_NONE && is_array($decoded);
+					if ($json_valid) {
+						$call_flow = $decoded;
+					}
+				}
+			}
+			return [
+				'present' => $present,
+				'size_bytes' => $size_bytes,
+				'sha256' => $sha256,
+				'json_valid' => $json_valid,
+				'call_flow' => $call_flow,
+			];
+		}
+
+
+		/**
+		 * Build recording metadata while keeping file access bounded and safe.
+		 *
+		 * @param array $row
+		 * @return array
+		 */
+		private function recording_metadata($row) {
+			$warnings = [];
+			$record_path = trim((string) ($row['record_path'] ?? ''));
+			$record_name = trim((string) ($row['record_name'] ?? ''));
+			$record_length = $row['record_length'] ?? null;
+			$availability_state = 'unavailable';
+			$file_exists = false;
+			$size_bytes = null;
+			$mtime = null;
+			$extension = null;
+			$mime_guess = null;
+
+			if ($record_path === '' && $record_name === '') {
+				$availability_state = 'not_recorded';
+			}
+			else {
+				$path_valid = $record_path !== '' && strpos($record_path, "\0") === false && !preg_match('/^[a-z][a-z0-9+\-.]*:\/\//i', $record_path);
+				$name_valid = $record_name !== ''
+					&& strpos($record_name, "\0") === false
+					&& strpos($record_name, '..') === false
+					&& strpos($record_name, '/') === false
+					&& strpos($record_name, '\\') === false
+					&& !preg_match('/^[a-z][a-z0-9+\-.]*:\/\//i', $record_name);
+
+				$file_path = null;
+				if (!$path_valid || !$name_valid) {
+					$availability_state = 'invalid_reference';
+					$warnings[] = 'Recording metadata contains an invalid record path or filename.';
+				}
+				else {
+					$file_path = rtrim($record_path, '/').'/'.$record_name;
+					$file_exists = is_file($file_path);
+					if ($file_exists) {
+						$availability_state = 'available';
+						$size_bytes = @filesize($file_path);
+						$file_mtime = @filemtime($file_path);
+						$mtime = $file_mtime ? gmdate('c', $file_mtime) : null;
+						$extension = strtolower((string) pathinfo($record_name, PATHINFO_EXTENSION));
+						if (function_exists('finfo_open') && is_readable($file_path)) {
+							$finfo = @finfo_open(FILEINFO_MIME_TYPE);
+							if ($finfo) {
+								$mime_guess_result = @finfo_file($finfo, $file_path);
+								if (is_string($mime_guess_result) && $mime_guess_result !== '') {
+									$mime_guess = $mime_guess_result;
+								}
+								@finfo_close($finfo);
+							}
+						}
+						if ($mime_guess === null && function_exists('mime_content_type') && is_readable($file_path)) {
+							$mime_guess_result = @mime_content_type($file_path);
+							if (is_string($mime_guess_result) && $mime_guess_result !== '') {
+								$mime_guess = $mime_guess_result;
+							}
+						}
+					}
+					else {
+						$availability_state = 'missing';
+					}
+				}
+			}
+
+			return [
+				'warnings' => $warnings,
+				'metadata' => [
+					'record_path' => $record_path !== '' ? $record_path : null,
+					'record_name' => $record_name !== '' ? $record_name : null,
+					'record_length' => $record_length,
+					'file_exists' => $file_exists,
+					'size_bytes' => is_numeric($size_bytes) ? (int) $size_bytes : null,
+					'mtime' => $mtime,
+					'extension' => $extension,
+					'mime_guess' => $mime_guess,
+					'availability_state' => $availability_state,
+					'warnings' => $warnings,
+				],
+			];
+		}
+
+
+		/**
+		 * Build transcript metadata without including transcript body content.
+		 *
+		 * @param string $xml_cdr_uuid
+		 * @param array|null $queue_row
+		 * @param array|null $transcript_row
+		 * @return array
+		 */
+		private function transcript_metadata($xml_cdr_uuid, $queue_row, $transcript_row) {
+			$queue_row = is_array($queue_row) ? $queue_row : [];
+			$transcript_row = is_array($transcript_row) ? $transcript_row : [];
+
+			$queue_uuid = trim((string) ($queue_row['transcribe_queue_uuid'] ?? ''));
+			$queue_present = $queue_uuid !== '';
+			$queue_status = trim((string) ($queue_row['transcribe_status'] ?? ''));
+			$duration_raw = $queue_row['transcribe_duration'] ?? null;
+			$duration = is_numeric($duration_raw) ? (float) $duration_raw : null;
+			$hostname = trim((string) ($queue_row['hostname'] ?? ''));
+			$audio_path = trim((string) ($queue_row['transcribe_audio_path'] ?? ''));
+			$audio_name = trim((string) ($queue_row['transcribe_audio_name'] ?? ''));
+
+			$transcript_present = !empty($transcript_row);
+			$transcript_json = $transcript_row['transcript_json'] ?? null;
+			$json_valid = null;
+			$segment_count = null;
+			if ($transcript_present) {
+				if (is_array($transcript_json)) {
+					$json_valid = true;
+					if (isset($transcript_json['segments']) && is_array($transcript_json['segments'])) {
+						$segment_count = count($transcript_json['segments']);
+					}
+				}
+				elseif (is_object($transcript_json)) {
+					$encoded = json_encode($transcript_json, JSON_UNESCAPED_SLASHES);
+					$decoded = $encoded === false ? null : json_decode($encoded, true);
+					$json_valid = is_array($decoded);
+					if (is_array($decoded) && isset($decoded['segments']) && is_array($decoded['segments'])) {
+						$segment_count = count($decoded['segments']);
+					}
+				}
+				else {
+					$decoded = json_decode((string) $transcript_json, true);
+					$json_valid = json_last_error() === JSON_ERROR_NONE && is_array($decoded);
+					if ($json_valid && isset($decoded['segments']) && is_array($decoded['segments'])) {
+						$segment_count = count($decoded['segments']);
+					}
+				}
+			}
+
+			$summary = $transcript_row['transcript_summary'] ?? null;
+			$summary_present = is_string($summary) && trim($summary) !== '';
+			$summary_length = $summary_present ? strlen((string) $summary) : 0;
+
+			return [
+				'requested' => $queue_present || $transcript_present,
+				'queue_uuid' => $queue_present ? $queue_uuid : null,
+				'queue_status' => $queue_status !== '' ? $queue_status : null,
+				'duration' => $duration,
+				'hostname' => $hostname !== '' ? $hostname : null,
+				'audio_path' => $audio_path !== '' ? $audio_path : null,
+				'audio_name' => $audio_name !== '' ? $audio_name : null,
+				'transcript_row_present' => $transcript_present,
+				'json_valid' => $json_valid,
+				'segment_count' => $segment_count,
+				'summary_present' => $summary_present,
+				'summary_length' => $summary_length,
+			];
+		}
+
+		/**
+		 * Build raw CDR provenance metadata while excluding raw body content.
+		 *
+		 * @param string $xml_cdr_uuid
+		 * @param array $row
+		 * @return array
+		 */
+		private function cdr_provenance_metadata($xml_cdr_uuid, $row) {
+			$warnings = [];
+			$row = is_array($row) ? $row : [];
+			$xml_value = $row['xml'] ?? null;
+			$json_value = $row['json'] ?? null;
+			$start_stamp_value = $row['start_stamp'] ?? null;
+			$archive_files = [];
+
+			$xml_meta = $this->body_provenance($xml_value, 'xml');
+			$json_meta = $this->body_provenance($json_value, 'json');
+
+			$start_stamp = null;
+			if (!empty($start_stamp_value)) {
+				try {
+					$start_stamp = new DateTime((string) $start_stamp_value);
+				}
+				catch (Throwable $e) {
+					$warnings[] = 'Unable to parse start_stamp for archive metadata lookup.';
+				}
+			}
+			else {
+				$warnings[] = 'start_stamp unavailable for archive metadata lookup.';
+			}
+
+			$xml_cdr_archive_base = $this->xml_cdr_archive_base_path();
+			if ($start_stamp instanceof DateTime && $xml_cdr_archive_base !== null) {
+				$year = $start_stamp->format('Y');
+				$month = $start_stamp->format('M');
+				$day = $start_stamp->format('d');
+				$archive_dir = rtrim($xml_cdr_archive_base, '/').'/'.$year.'/'.$month.'/'.$day;
+				$expected_files = [
+					$archive_dir.'/'.$xml_cdr_uuid.'.xml' => 'xml',
+					$archive_dir.'/'.$xml_cdr_uuid.'.json' => 'json',
+				];
+				foreach ($expected_files as $path => $format) {
+					$archive_files[] = $this->archive_file_metadata($path, $format);
+				}
+			}
+			elseif ($xml_cdr_archive_base === null) {
+				$warnings[] = 'switch log path unavailable for archive metadata lookup.';
+			}
+
+			return [
+				'warnings' => $warnings,
+				'metadata' => [
+					'db_xml' => $xml_meta,
+					'db_json' => $json_meta,
+					'archive_files' => $archive_files,
+				],
+			];
+		}
+
+		/**
+		 * Build provenance metadata for a DB CDR body field.
+		 *
+		 * @param mixed $value
+		 * @param string $format
+		 * @return array
+		 */
+		private function body_provenance($value, $format) {
+			$present = !($value === null || $value === '');
+			$size_bytes = null;
+			$sha256 = null;
+			$parse_status = 'not_present';
+			if ($present) {
+				$body_string = null;
+				if (is_array($value) || is_object($value)) {
+					$body_string = json_encode($value, JSON_UNESCAPED_SLASHES);
+				}
+				else {
+					$body_string = (string) $value;
+				}
+				if (is_string($body_string)) {
+					$size_bytes = strlen($body_string);
+					$sha256 = hash('sha256', $body_string);
+					if ($format === 'xml') {
+						$parse_status = @simplexml_load_string($body_string, 'SimpleXMLElement', LIBXML_NOCDATA) !== false ? 'valid' : 'invalid';
+					}
+					else {
+						json_decode($body_string, true);
+						$parse_status = json_last_error() === JSON_ERROR_NONE ? 'valid' : 'invalid';
+					}
+				}
+				else {
+					$parse_status = 'unavailable';
+				}
+			}
+			return [
+				'present' => $present,
+				'size_bytes' => $size_bytes,
+				'sha256' => $sha256,
+				'parse_status' => $parse_status,
+			];
+		}
+
+		/**
+		 * Build archive file metadata for an expected UUID-based archive file.
+		 *
+		 * @param string $path
+		 * @param string $format
+		 * @return array
+		 */
+		private function archive_file_metadata($path, $format) {
+			$exists = is_file($path);
+			$size_bytes = $exists ? @filesize($path) : null;
+			$file_mtime = $exists ? @filemtime($path) : null;
+			$sha256 = ($exists && is_readable($path)) ? @hash_file('sha256', $path) : null;
+			return [
+				'format' => $format,
+				'file_name' => basename($path),
+				'present' => $exists,
+				'size_bytes' => is_numeric($size_bytes) ? (int) $size_bytes : null,
+				'mtime' => $file_mtime ? gmdate('c', $file_mtime) : null,
+				'sha256' => is_string($sha256) && $sha256 !== '' ? $sha256 : null,
+			];
+		}
+
+		/**
+		 * Resolve the XML CDR archive base path from settings.
+		 *
+		 * @return string|null
+		 */
+		private function xml_cdr_archive_base_path() {
+			if (!class_exists('settings')) {
+				return '/var/log/freeswitch/xml_cdr/archive';
+			}
+			try {
+				$settings = new settings;
+				$switch_log = $settings->get('switch', 'log', '/var/log/freeswitch');
+				$switch_log = trim((string) $switch_log);
+				if ($switch_log === '') {
+					return null;
+				}
+				return rtrim($switch_log, '/').'/xml_cdr/archive';
+			}
+			catch (Throwable $e) {
+				return null;
+			}
+		}
+
+		/**
+		 * Build failed-import metadata using UUID-derived expected file names only.
+		 *
+		 * @param string $xml_cdr_uuid
+		 * @return array
+		 */
+		private function failed_import_artifact_metadata($xml_cdr_uuid) {
+			$xml_cdr_uuid = trim((string) $xml_cdr_uuid);
+			$base_failed = $this->xml_cdr_failed_base_path();
+			if ($xml_cdr_uuid === '' || $base_failed === null) {
+				return [
+					'present' => false,
+					'artifacts' => [],
+				];
+			}
+
+			$expected_names = [
+				$xml_cdr_uuid.'.cdr.xml',
+				'a_'.$xml_cdr_uuid.'.cdr.xml',
+				$xml_cdr_uuid.'.cdr.json',
+				'a_'.$xml_cdr_uuid.'.cdr.json',
+				$xml_cdr_uuid.'.xml',
+				$xml_cdr_uuid.'.json',
+			];
+			$failed_dirs = [
+				'failed',
+				'failed/xml',
+				'failed/sql',
+				'failed/size',
+			];
+
+			$artifacts = [];
+			foreach ($failed_dirs as $failed_dir) {
+				foreach ($expected_names as $expected_name) {
+					$full_path = rtrim($base_failed, '/').'/'.$failed_dir.'/'.$expected_name;
+					if (is_file($full_path)) {
+						$size_bytes = @filesize($full_path);
+						$file_mtime = @filemtime($full_path);
+						$sha256 = is_readable($full_path) ? @hash_file('sha256', $full_path) : null;
+						$artifacts[] = [
+							'location' => $failed_dir.'/'.$expected_name,
+							'present' => true,
+							'size_bytes' => is_numeric($size_bytes) ? (int) $size_bytes : null,
+							'mtime' => $file_mtime ? gmdate('c', $file_mtime) : null,
+							'sha256' => is_string($sha256) && $sha256 !== '' ? $sha256 : null,
+						];
+					}
+				}
+			}
+
+			return [
+				'present' => !empty($artifacts),
+				'artifacts' => $artifacts,
+			];
+		}
+
+		/**
+		 * Resolve the XML CDR failed-import base path from settings.
+		 *
+		 * @return string|null
+		 */
+		private function xml_cdr_failed_base_path() {
+			if (!class_exists('settings')) {
+				return '/var/log/freeswitch/xml_cdr';
+			}
+			try {
+				$settings = new settings;
+				$switch_log = $settings->get('switch', 'log', '/var/log/freeswitch');
+				$switch_log = trim((string) $switch_log);
+				if ($switch_log === '') {
+					return null;
+				}
+				return rtrim($switch_log, '/').'/xml_cdr';
+			}
+			catch (Throwable $e) {
+				return null;
 			}
 		}
 	}
