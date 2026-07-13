@@ -477,7 +477,10 @@
 				$parameters['domain_uuid'] = $_SESSION['domain_uuid'];
 				$parameters['group_uuid'] = $group_uuid;
 				$row = $database->select($sql, $parameters, 'row');
-				if ($row['group_level'] <= $_SESSION['user']['group_level']) {
+				//delegation rule: groups in a lower level are open (hierarchy), but a group at your own level
+				//may only be assigned if you are a member of it (you can only give out groups you are part of)
+				$my_group_uuids = array_column($_SESSION['user']['groups'] ?? [], 'group_uuid');
+				if ($row['group_level'] < $_SESSION['user']['group_level'] || in_array($group_uuid, $my_group_uuids)) {
 					$array['user_groups'][$n]['user_group_uuid'] = uuid();
 					$array['user_groups'][$n]['domain_uuid'] = $domain_uuid;
 					$array['user_groups'][$n]['group_name'] = $group_name;
@@ -580,19 +583,12 @@
 				$array['users'][$x]['password'] = password_hash($password, PASSWORD_DEFAULT, $options);
 				$array['users'][$x]['salt'] = null;
 
-				//remove remember me tokens
-				$sql = "update v_user_logs ";
-				$sql .= "set remember_selector = null, ";
-				$sql .= "remember_validator = null ";
-				$sql .= "where user_uuid = :user_uuid ";
-				$parameters['user_uuid'] = $user_uuid;
-				$database->execute($sql, $parameters);
-				unset($sql, $parameters);
+				//delete remember me tokens
+				remember_me::delete_user_tokens($user_uuid);
 
 				// Unset remember me cookie
 				if ($user_uuid == $_SESSION['user_uuid']) {
-					unset($_COOKIE['remember']);
-					setcookie('remember', '', time() - 3600, '/');
+					remember_me::clear_cookie();
 				}
 
 				//send the password changed email
@@ -1165,8 +1161,11 @@
 			if (isset($assigned_groups)) { echo "<br />\n"; }
 			echo "<select name='group_uuid_name' class='formfld' style='width: auto; margin-right: 3px;' ".($action == 'add' ? "required='required'" : null).">\n";
 			echo "	<option value=''></option>\n";
+			//delegation rule: lower levels are open (hierarchy), but a group at your own level is only
+			//offered if you are a member of it (you can only give out groups you are part of)
+			$my_group_uuids = array_column($_SESSION['user']['groups'] ?? [], 'group_uuid');
 			foreach($groups as $field) {
-				if ($field['group_level'] <= $_SESSION['user']['group_level']) {
+				if ($field['group_level'] < $_SESSION['user']['group_level'] || in_array($field['group_uuid'], $my_group_uuids)) {
 					if (!isset($assigned_groups) || (isset($assigned_groups) && !in_array($field["group_uuid"], $assigned_groups))) {
 						if (isset($group_uuid_name) && $group_uuid_name == $field['group_uuid']."|".$field['group_name']) { $selected = "selected='selected'"; } else { $selected = ''; }
 						echo "	<option value='".$field['group_uuid']."|".$field['group_name']."' $selected>".$field['group_name'].((!empty($field['domain_uuid'])) ? "@".$_SESSION['domains'][$field['domain_uuid']]['domain_name'] : null)."</option>\n";
